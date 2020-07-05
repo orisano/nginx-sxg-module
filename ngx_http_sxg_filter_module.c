@@ -36,7 +36,7 @@ typedef struct {
   ngx_str_t certificate_key;
   ngx_str_t cert_url;
   ngx_str_t validity_url;
-  ngx_str_t cert_path;
+  ngx_flag_t cert;
   sxg_signer_list_t signers;
   ngx_sxg_cert_chain_t cert_chain;
 } ngx_http_sxg_loc_conf_t;
@@ -76,6 +76,7 @@ static ngx_int_t ngx_http_sxg_body_filter_impl(ngx_http_request_t* req,
                                                ngx_http_sxg_ctx_t* ctx,
                                                ngx_chain_t* in);
 static bool is_valid_config(ngx_conf_t* nc, const ngx_http_sxg_loc_conf_t* sc);
+static ngx_int_t ngx_http_cert_chain_handler(ngx_http_request_t* req);
 
 static ngx_command_t ngx_http_sxg_commands[] = {
     {ngx_string("sxg"), NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
@@ -96,9 +97,9 @@ static ngx_command_t ngx_http_sxg_commands[] = {
     {ngx_string("sxg_validity_url"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_sxg_loc_conf_t, validity_url), NULL},
-    {ngx_string("sxg_cert_path"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
-     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_sxg_loc_conf_t, cert_path), NULL},
+    {ngx_string("sxg_cert"), NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
+     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_sxg_loc_conf_t, cert), NULL},
     ngx_null_command};
 
 static ngx_http_module_t ngx_http_sxg_filter_module_ctx = {
@@ -149,7 +150,7 @@ static void* ngx_http_sxg_create_loc_conf(ngx_conf_t* cf) {
   slc->certificate_key = (ngx_str_t){.data = NULL, .len = 0};
   slc->cert_url = (ngx_str_t){.data = NULL, .len = 0};
   slc->validity_url = (ngx_str_t){.data = NULL, .len = 0};
-  slc->cert_path = (ngx_str_t){.data = NULL, .len = 0};
+  slc->cert = NGX_CONF_UNSET;
   slc->cert_chain = ngx_sxg_empty_cert_chain();
   slc->signers = sxg_empty_signer_list();
   return slc;
@@ -159,6 +160,14 @@ static char* ngx_http_sxg_merge_loc_conf(ngx_conf_t* cf, void* parent,
                                          void* child) {
   ngx_http_sxg_loc_conf_t* prev = parent;
   ngx_http_sxg_loc_conf_t* conf = child;
+
+  if (conf->enable == 1 && conf->cert == 1) {
+    ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                  "nginx-sxg-module: `sxg on` and `sxg_cert on` cannot place "
+                  "to the same location");
+    return NGX_CONF_ERROR;
+  }
+
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_size_value(conf->sxg_max_payload, prev->sxg_max_payload,
                             64 * 1024 * 1024);  // Limited to 64 MB
@@ -166,7 +175,7 @@ static char* ngx_http_sxg_merge_loc_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_str_value(conf->certificate_key, prev->certificate_key, "");
   ngx_conf_merge_str_value(conf->cert_url, prev->cert_url, "");
   ngx_conf_merge_str_value(conf->validity_url, prev->validity_url, "");
-  ngx_conf_merge_str_value(conf->cert_path, prev->cert_path, "");
+  ngx_conf_init_value(conf->cert, 0);
 
   if (!is_valid_config(cf, conf)) {
     if (conf->enable) {
@@ -208,14 +217,18 @@ static char* ngx_http_sxg_merge_loc_conf(ngx_conf_t* cf, void* parent,
     X509_free(cert);
   }
 
-  if (prev->cert_chain.certificate != NULL && prev->cert_chain.issuer != NULL) {
-    conf->cert_chain = prev->cert_chain;
-  } else {
-    if (conf->cert_path.len > 0 &&
-        !load_cert_chain((const char*)conf->certificate.data,
+  if (conf->cert) {
+    if (!load_cert_chain((const char*)conf->certificate.data,
                          &conf->cert_chain)) {
+      ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                    "nginx-sxg-module: failed to load cert chain");
       return NGX_CONF_ERROR;
     }
+
+    conf->enable = 0;
+    ngx_http_core_loc_conf_t* clcf =
+        ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_cert_chain_handler;
   }
 
   if (loaded) {
@@ -224,10 +237,9 @@ static char* ngx_http_sxg_merge_loc_conf(ngx_conf_t* cf, void* parent,
                   "SXG Certificate: %V\n"
                   "SXG PrivateKey: %V\n"
                   "certificate_url: %V\n"
-                  "validity_url: %V\n"
-                  "cert_path: %V",
+                  "validity_url: %V",
                   &conf->certificate, &conf->certificate_key, &conf->cert_url,
-                  &conf->validity_url, &conf->cert_path);
+                  &conf->validity_url);
   }
 
   return NGX_OK;
@@ -607,15 +619,6 @@ static ngx_int_t ngx_http_sxg_header_filter(ngx_http_request_t* req) {
     return ngx_http_next_header_filter(req);
   }
 
-  if (slc->cert_path.len > 0 && req->uri.len == slc->cert_path.len &&
-      ngx_memcmp(req->uri.data, slc->cert_path.data, req->uri.len) == 0) {
-    int rc = ngx_http_send_header(req);
-    if (rc == NGX_ERROR || rc > NGX_OK || req->header_only) {
-      return rc;
-    }
-    return NGX_OK;
-  }
-
   if (!response_should_be_sxg(req) || req->header_only ||
       (req->method & NGX_HTTP_HEAD) || req != req->main ||
       req->headers_out.status == NGX_HTTP_NO_CONTENT || req->parent != NULL) {
@@ -926,10 +929,6 @@ static ngx_int_t ngx_http_cert_chain_handler(ngx_http_request_t* req) {
   // Check the URL is a certificate request.
   ngx_http_sxg_loc_conf_t* slc =
       ngx_http_get_module_loc_conf(req, ngx_http_sxg_filter_module);
-  if (slc->cert_path.len <= 0 || req->uri.len != slc->cert_path.len ||
-      ngx_memcmp(req->uri.data, slc->cert_path.data, req->uri.len) != 0) {
-    return NGX_OK;
-  }
   bool refreshed = refresh_if_needed(&slc->cert_chain);
   if (refreshed) {
     ngx_log_error(
@@ -951,33 +950,17 @@ static ngx_int_t ngx_http_cert_chain_handler(ngx_http_request_t* req) {
                   "nginx-sxg-module: failed to generate Cert-Chain");
     return NGX_ERROR;
   }
-  if (ngx_http_next_header_filter(req) != NGX_OK ||
-      ngx_http_next_body_filter(req, out) != NGX_OK) {
-    ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
-                  "nginx-sxg-module: failed to return payload");
-    return NGX_ERROR;
+  int rc = ngx_http_send_header(req);
+  if (rc != NGX_OK) {
+    return rc;
   }
-  return NGX_DONE;
+  return ngx_http_output_filter(req, out);
 }
 
 static ngx_int_t ngx_http_sxg_filter_init(ngx_conf_t* cf) {
-  ngx_http_core_main_conf_t* cmcf =
-      ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
   ngx_http_next_header_filter = ngx_http_top_header_filter;
   ngx_http_top_header_filter = ngx_http_sxg_header_filter;
   ngx_http_next_body_filter = ngx_http_top_body_filter;
   ngx_http_top_body_filter = ngx_http_sxg_body_filter;
-
-  // Cert-Chain handler
-  ngx_http_handler_pt* h =
-      ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
-  if (h == NULL) {
-    ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
-                  "nginx-sxg-module: initialization failed");
-    return NGX_ERROR;
-  }
-
-  *h = ngx_http_cert_chain_handler;
   return NGX_OK;
 }
